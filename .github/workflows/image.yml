@@ -1,0 +1,110 @@
+name: Build and push image
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when upstream has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: scrubshot-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out packaging repository
+        uses: actions/checkout@v5
+
+      - name: Compare upstream main with the last build
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_BUILD: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          git ls-remote https://github.com/strugglesky/scrubshot.git refs/heads/main > upstream-head
+          sha=$(cut -f1 upstream-head)
+          have_sha=$(node -p "require('./upstream.json').sha || ''")
+          have_patch=$(node -p "String(require('./upstream.json').version || '0.1.0').split('.').at(-1)")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$sha" != "$have_sha" ] || [ "$FORCE_BUILD" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "version=1.$((have_patch + 1))" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out locked upstream source
+        if: steps.state.outputs.build == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: strugglesky/scrubshot
+          ref: ${{ steps.state.outputs.sha }}
+          path: upstream
+
+      - name: Set up QEMU
+        if: steps.state.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        if: steps.state.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.state.outputs.build == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        if: steps.state.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          dockerfile: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/strugglesky/scrubshot
+            org.opencontainers.image.revision=${{ steps.state.outputs.sha }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/scrubshot:${{ steps.state.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/scrubshot:latest
+          cache-from: type=gha,scope=scrubshot
+          cache-to: type=gha,mode=max,scope=scrubshot
+
+      - name: Make the GHCR package public
+        if: steps.state.outputs.build == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH "orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/scrubshot" -f visibility=public || true
+
+      - name: Record the built upstream commit
+        if: steps.state.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.state.outputs.sha }}
+          VERSION: ${{ steps.state.outputs.version }}
+        run: |
+          set -euo pipefail
+          content=$(printf '{\n  "sha": "%s",\n  "version": "%s"\n}\n' "$UPSTREAM_SHA" "$VERSION" | base64 -w0)
+          file_sha=$(gh api "repos/${{ github.repository }}/contents/upstream.json" --jq .sha)
+          short=$(printf '%s' "$UPSTREAM_SHA" | cut -c1-7)
+          gh api -X PUT "repos/${{ github.repository }}/contents/upstream.json" \
+            -f message="chore: record build $VERSION (upstream $short)" \
+            -f content="$content" -f sha="$file_sha" -f branch=main >/dev/null
+          echo "built ghcr.io/${{ github.repository_owner }}/scrubshot:$VERSION and latest from $short"
